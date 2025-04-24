@@ -418,7 +418,7 @@ pub struct Builder {
     max_frame_len: usize,
 
     // Number of bytes representing the field length
-    length_field_len: usize,
+    length_field_len: LengthLen,
 
     // Number of bytes in the header before the length field
     length_field_offset: usize,
@@ -432,6 +432,67 @@ pub struct Builder {
 
     // Length field byte order (little or big endian)
     length_field_is_big_endian: bool,
+}
+
+/// specify how length field is decoded
+#[derive(Debug, Clone, Copy)]
+pub enum LengthLen {
+    /// protobuf style variant int
+    PBVarInt,
+    /// fix width
+    Fix(usize),
+}
+
+impl From<usize> for LengthLen {
+    fn from(value: usize) -> Self {
+        Self::Fix(value)
+    }
+}
+
+impl LengthLen {
+    fn reserve_len(&self) -> usize {
+        match self {
+            LengthLen::PBVarInt => 10,
+            LengthLen::Fix(len) => *len,
+        }
+    }
+}
+
+fn encode_pb_varint(mut value: u64, buf: &mut BytesMut) {
+    for _ in 0..10 {
+        if value < 0x80 {
+            buf.put_u8(value as u8);
+            break;
+        } else {
+            buf.put_u8(((value & 0x7F) | 0x80) as u8);
+            value >>= 7;
+        }
+    }
+}
+
+/// copy from prost
+fn decode_pb_varint(mut src: Cursor<&mut BytesMut>) -> io::Result<(u64, usize)> {
+    let mut value = 0;
+    for count in 0..std::cmp::min(10, src.remaining()) {
+        let byte = src.get_u8();
+        value |= u64::from(byte & 0x7F) << (count * 7);
+        if byte <= 0x7F {
+            // Check for u64::MAX overflow. See [`ConsumeVarint`][1] for details.
+            // [1]: https://github.com/protocolbuffers/protobuf-go/blob/v1.27.1/encoding/protowire/wire.go#L358
+            if count == 9 && byte >= 0x02 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    LengthDelimitedCodecError { _priv: () },
+                ));
+            } else {
+                return Ok((value, count + 1));
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        LengthDelimitedCodecError { _priv: () },
+    ))
 }
 
 /// An error when the number of bytes read is more than max frame length.
@@ -506,17 +567,28 @@ impl LengthDelimitedCodec {
             return Ok(None);
         }
 
+        let num_to_skip;
         let n = {
             let mut src = Cursor::new(&mut *src);
 
             // Skip the required bytes
             src.advance(self.builder.length_field_offset);
 
-            // match endianness
-            let n = if self.builder.length_field_is_big_endian {
-                src.get_uint(field_len)
-            } else {
-                src.get_uint_le(field_len)
+            let n = match field_len {
+                LengthLen::PBVarInt => {
+                    let (n, count) = decode_pb_varint(src)?;
+                    num_to_skip = count;
+                    n
+                }
+                LengthLen::Fix(field_len) => {
+                    // match endianness
+                    num_to_skip = field_len;
+                    if self.builder.length_field_is_big_endian {
+                        src.get_uint(field_len)
+                    } else {
+                        src.get_uint_le(field_len)
+                    }
+                }
             };
 
             if n > self.builder.max_frame_len as u64 {
@@ -548,7 +620,11 @@ impl LengthDelimitedCodec {
             }
         };
 
-        src.advance(self.builder.get_num_skip());
+        src.advance(
+            self.builder
+                .num_skip
+                .unwrap_or(self.builder.length_field_offset + num_to_skip),
+        );
 
         // Ensure that the buffer has enough space to read the incoming
         // payload
@@ -628,12 +704,19 @@ impl Encoder<Bytes> for LengthDelimitedCodec {
 
         // Reserve capacity in the destination buffer to fit the frame and
         // length field (plus adjustment).
-        dst.reserve(self.builder.length_field_len + n);
+        dst.reserve(self.builder.length_field_len.reserve_len() + n);
 
-        if self.builder.length_field_is_big_endian {
-            dst.put_uint(n as u64, self.builder.length_field_len);
-        } else {
-            dst.put_uint_le(n as u64, self.builder.length_field_len);
+        match self.builder.length_field_len {
+            LengthLen::PBVarInt => {
+                encode_pb_varint(n as u64, dst);
+            }
+            LengthLen::Fix(len) => {
+                if self.builder.length_field_is_big_endian {
+                    dst.put_uint(n as u64, len);
+                } else {
+                    dst.put_uint_le(n as u64, len);
+                }
+            }
         }
 
         // Write the frame to the buffer
@@ -694,7 +777,7 @@ impl Builder {
             max_frame_len: 8 * 1_024 * 1_024,
 
             // Default byte length of 4
-            length_field_len: 4,
+            length_field_len: LengthLen::Fix(4),
 
             // Default to the header field being at the start of the header.
             length_field_offset: 0,
@@ -871,8 +954,14 @@ impl Builder {
     /// # }
     /// # pub fn main() {}
     /// ```
-    pub fn length_field_length(&mut self, val: usize) -> &mut Self {
-        assert!(val > 0 && val <= 8, "invalid length field length");
+    pub fn length_field_length(&mut self, val: impl Into<LengthLen>) -> &mut Self {
+        let val: LengthLen = val.into();
+        match val {
+            LengthLen::Fix(val) => {
+                assert!(val > 0 && val <= 8, "invalid length field length");
+            }
+            _ => {}
+        }
         self.length_field_len = val;
         self
     }
@@ -1039,18 +1128,13 @@ impl Builder {
     }
 
     fn num_head_bytes(&self) -> usize {
-        let num = self.length_field_offset + self.length_field_len;
+        let num = self.length_field_offset + self.length_field_len.reserve_len();
         cmp::max(num, self.num_skip.unwrap_or(0))
-    }
-
-    fn get_num_skip(&self) -> usize {
-        self.num_skip
-            .unwrap_or(self.length_field_offset + self.length_field_len)
     }
 
     fn adjust_max_frame_len(&mut self) {
         // Calculate the maximum number that can be represented using `length_field_len` bytes.
-        let max_number = match 1u64.checked_shl((8 * self.length_field_len) as u32) {
+        let max_number = match 1u64.checked_shl((8 * self.length_field_len.reserve_len()) as u32) {
             Some(shl) => shl - 1,
             None => u64::MAX,
         };

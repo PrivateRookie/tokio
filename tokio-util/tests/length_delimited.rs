@@ -93,6 +93,19 @@ fn read_single_frame_one_packet() {
 }
 
 #[test]
+fn read_single_varint_frame_one_packet() {
+    let io = length_delimited::Builder::new()
+        .length_field_length(length_delimited::LengthLen::PBVarInt)
+        .new_read(mock! {
+            data(b"\x09abcdefghi"),
+        });
+    pin_mut!(io);
+
+    assert_next_eq!(io, b"abcdefghi");
+    assert_done!(io);
+}
+
+#[test]
 fn read_single_frame_one_packet_little_endian() {
     let io = length_delimited::Builder::new()
         .little_endian()
@@ -120,6 +133,26 @@ fn read_single_frame_one_packet_native_endian() {
     pin_mut!(io);
 
     assert_next_eq!(io, b"abcdefghi");
+    assert_done!(io);
+}
+
+#[test]
+fn read_single_multi_varint_frame_one_packet() {
+    let mut d: Vec<u8> = vec![];
+    d.extend_from_slice(b"\x09abcdefghi");
+    d.extend_from_slice(b"\x03123");
+    d.extend_from_slice(b"\x0bhello world");
+
+    let io = length_delimited::Builder::new()
+        .length_field_length(length_delimited::LengthLen::PBVarInt)
+        .new_read(mock! {
+            data(&d),
+        });
+    pin_mut!(io);
+
+    assert_next_eq!(io, b"abcdefghi");
+    assert_next_eq!(io, b"123");
+    assert_next_eq!(io, b"hello world");
     assert_done!(io);
 }
 
@@ -157,6 +190,25 @@ fn read_single_frame_multi_packet() {
     pin_mut!(io);
 
     assert_next_eq!(io, b"abcdefghi");
+    assert_done!(io);
+}
+
+#[test]
+fn read_multi_varint_frame_multi_packet() {
+    let io = length_delimited::Builder::new()
+        .length_field_length(length_delimited::LengthLen::PBVarInt)
+        .new_read(mock! {
+            data(b"\x09"),
+            data(b"abc"),
+            data(b"defghi"),
+            data(b"\x0312"),
+            data(b"3\x0bhello world"),
+        });
+    pin_mut!(io);
+
+    assert_next_eq!(io, b"abcdefghi");
+    assert_next_eq!(io, b"123");
+    assert_next_eq!(io, b"hello world");
     assert_done!(io);
 }
 
@@ -409,6 +461,27 @@ fn read_single_multi_frame_one_packet_length_includes_head() {
     assert_next_eq!(io, b"123");
     assert_next_eq!(io, b"hello world");
     assert_done!(io);
+}
+
+
+#[test]
+fn write_single_varint_frame_length_adjusted() {
+    let io = length_delimited::Builder::new()
+        .length_adjustment(-2)
+        .length_field_length(length_delimited::LengthLen::PBVarInt)
+        .new_write(mock! {
+            data(b"\x0b"),
+            data(b"abcdefghi"),
+            flush(),
+        });
+    pin_mut!(io);
+
+    task::spawn(()).enter(|cx, _| {
+        assert_ready_ok!(io.as_mut().poll_ready(cx));
+        assert_ok!(io.as_mut().start_send(Bytes::from("abcdefghi")));
+        assert_ready_ok!(io.as_mut().poll_flush(cx));
+        assert!(io.get_ref().calls.is_empty());
+    });
 }
 
 #[test]
